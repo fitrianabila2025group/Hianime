@@ -63,6 +63,185 @@ function isStrategyAvailable(name) {
 }
 
 // ============================================================
+// IMUNIFY360 / WEBSHIELD COOKIE JAR
+// ============================================================
+// Imunify360 WebShield sets cookies (e.g. wsidchk, __imunify_session)
+// after a challenge redirect. We store them and send on every request.
+const cookieJar = new Map(); // key=cookieName, value=cookieValue
+let cookieJarString = ""; // pre-built "name=val; name2=val2" string
+
+function updateCookieJar(setCookieHeaders) {
+  if (!setCookieHeaders) return;
+  const headers = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+  for (const sc of headers) {
+    // Parse "name=value; Path=...; ..." → extract name=value
+    const match = sc.match(/^([^=]+)=([^;]*)/);
+    if (match) {
+      cookieJar.set(match[1].trim(), match[2].trim());
+    }
+  }
+  // Rebuild the cookie string
+  const parts = [];
+  for (const [k, v] of cookieJar.entries()) {
+    parts.push(`${k}=${v}`);
+  }
+  cookieJarString = parts.join("; ");
+  if (cookieJar.size > 0) {
+    console.log(`[cookiejar] Updated: ${cookieJar.size} cookies stored`);
+  }
+}
+
+function getCookieString() {
+  return cookieJarString;
+}
+
+/**
+ * Detect Imunify360 WebShield challenge redirect.
+ * Pattern: 302/301 redirect to /z0f76a...?wsidchk=...
+ * or response body containing wsidchk / imunify references
+ */
+function isImunifyChallenge(upstreamRes) {
+  const status = upstreamRes.status;
+  const location = getHeader(upstreamRes.headers, "location") || "";
+  const server = (getHeader(upstreamRes.headers, "server") || "").toLowerCase();
+
+  // Redirect-based challenge
+  if (status >= 300 && status < 400) {
+    if (location.includes("wsidchk") || /\/z[0-9a-f]{30,}/.test(location)) {
+      return { type: "redirect", location };
+    }
+  }
+
+  // Body-based challenge (some versions show inline)
+  if (status === 403 || status === 503 || status === 200) {
+    if (server.includes("openresty") || server.includes("imunify")) {
+      const bodyStr = upstreamRes.body.toString("utf-8").substring(0, 5000);
+      if (
+        bodyStr.includes("wsidchk") ||
+        bodyStr.includes("imunify") ||
+        bodyStr.includes("__imunify_session") ||
+        /\/z[0-9a-f]{30,}/.test(bodyStr)
+      ) {
+        // Try to extract redirect URL from body
+        const urlMatch = bodyStr.match(/(?:href|url|location)[="'\s]*(\/z[0-9a-f]+[^"'\s>]*wsidchk[^"'\s>]*)/i);
+        if (urlMatch) {
+          return { type: "redirect", location: urlMatch[1] };
+        }
+        return { type: "block" };
+      }
+    }
+  }
+
+  // 404 with openresty — likely Imunify blocked
+  if (status === 404 && server.includes("openresty")) {
+    const bodyStr = upstreamRes.body.toString("utf-8").substring(0, 2000);
+    if (bodyStr.includes("openresty") || bodyStr.length < 500) {
+      return { type: "block" };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Solve Imunify360 challenge: follow the redirect URL to get cookies,
+ * then return the cookies so subsequent requests pass.
+ */
+async function solveImunifyChallenge(challengeLocation, strategy) {
+  console.log(`[imunify] Solving challenge: ${challengeLocation}`);
+
+  // Ensure the location is a full path
+  let challengePath = challengeLocation;
+  if (challengePath.startsWith("http")) {
+    try {
+      const u = new URL(challengePath);
+      challengePath = u.pathname + u.search;
+    } catch {
+      // use as-is
+    }
+  }
+
+  const headers = {
+    host: TARGET_HOST,
+    "user-agent": getNextUA(),
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "accept-encoding": "gzip, deflate, br",
+    connection: "keep-alive",
+    "upgrade-insecure-requests": "1",
+    referer: `https://${TARGET_HOST}/`,
+  };
+  if (getCookieString()) {
+    headers["cookie"] = getCookieString();
+  }
+
+  let res;
+  try {
+    if (strategy === "directIP") {
+      res = await fetchViaDirectIPRaw(challengePath, headers, "GET", null);
+    } else {
+      res = await fetchViaDomainRaw(challengePath, headers, "GET", null);
+    }
+  } catch (err) {
+    console.error(`[imunify] Challenge request failed: ${err.message}`);
+    return false;
+  }
+
+  // Collect cookies from the challenge response
+  const setCookies = getSetCookieHeaders(res.headers);
+  if (setCookies.length > 0) {
+    updateCookieJar(setCookies);
+    console.log(`[imunify] Got ${setCookies.length} cookies from challenge`);
+  }
+
+  // If the challenge itself redirects again, follow up to 3 hops
+  let hops = 0;
+  let currentRes = res;
+  while (currentRes.status >= 300 && currentRes.status < 400 && hops < 3) {
+    const nextLoc = getHeader(currentRes.headers, "location");
+    if (!nextLoc) break;
+
+    let nextPath = nextLoc;
+    if (nextPath.startsWith("http")) {
+      try { nextPath = new URL(nextPath).pathname + new URL(nextPath).search; } catch {}
+    }
+
+    console.log(`[imunify] Following redirect hop ${hops + 1}: ${nextPath}`);
+    headers["cookie"] = getCookieString();
+
+    try {
+      if (strategy === "directIP") {
+        currentRes = await fetchViaDirectIPRaw(nextPath, headers, "GET", null);
+      } else {
+        currentRes = await fetchViaDomainRaw(nextPath, headers, "GET", null);
+      }
+      const moreCookies = getSetCookieHeaders(currentRes.headers);
+      if (moreCookies.length > 0) updateCookieJar(moreCookies);
+    } catch (err) {
+      console.error(`[imunify] Redirect hop failed: ${err.message}`);
+      break;
+    }
+    hops++;
+  }
+
+  console.log(`[imunify] Challenge solved. Cookie jar has ${cookieJar.size} cookies`);
+  return cookieJar.size > 0;
+}
+
+/**
+ * Extract Set-Cookie headers from response headers (handles both
+ * single string, array, and raw http headers where it could be joined)
+ */
+function getSetCookieHeaders(headers) {
+  if (!headers) return [];
+  // node http.IncomingMessage stores set-cookie as array
+  const sc = headers["set-cookie"];
+  if (!sc) return [];
+  if (Array.isArray(sc)) return sc;
+  return [sc];
+}
+
+// ============================================================
 // BROWSER-LIKE USER AGENTS (rotate to avoid fingerprinting)
 // ============================================================
 const USER_AGENTS = [
@@ -112,6 +291,7 @@ function buildUpstreamHeaders(req) {
     if (STRIP_REQUEST_HEADERS.has(lk)) continue;
     if (lk === "host") continue;
     if (lk === "user-agent") continue;
+    if (lk === "cookie") continue; // we manage cookies ourselves
     headers[key] = value;
   }
   headers["host"] = TARGET_HOST;
@@ -121,6 +301,10 @@ function buildUpstreamHeaders(req) {
   headers["accept-encoding"] = "gzip, deflate, br";
   headers["connection"] = "keep-alive";
   headers["upgrade-insecure-requests"] = "1";
+  // Attach stored cookies (Imunify360 wsidchk etc.)
+  if (getCookieString()) {
+    headers["cookie"] = getCookieString();
+  }
   if (req.headers["referer"]) {
     headers["referer"] = req.headers["referer"]
       .replace(new RegExp(escapeRegex(getMirrorHost(req)), "gi"), TARGET_HOST);
@@ -151,7 +335,11 @@ function escapeRegex(str) {
  * HTTPS request directly to origin IP, bypassing DNS/Cloudflare.
  * TLS SNI set to TARGET_HOST so cert validation works.
  */
-function fetchViaDirectIP(path, headers, method, body) {
+/**
+ * Raw direct IP fetch — returns result without Imunify handling.
+ * Used internally by the challenge solver.
+ */
+function fetchViaDirectIPRaw(path, headers, method, body) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: ORIGIN_IP,
@@ -189,9 +377,52 @@ function fetchViaDirectIP(path, headers, method, body) {
 }
 
 /**
+ * Direct IP fetch with Imunify360 challenge auto-solving.
+ */
+async function fetchViaDirectIP(path, headers, method, body) {
+  // Ensure cookies are attached
+  if (getCookieString() && !headers["cookie"]) {
+    headers["cookie"] = getCookieString();
+  }
+
+  const res = await fetchViaDirectIPRaw(path, headers, method, body);
+
+  // Collect any cookies
+  const sc = getSetCookieHeaders(res.headers);
+  if (sc.length > 0) updateCookieJar(sc);
+
+  // Check for Imunify360 challenge
+  const imunify = isImunifyChallenge(res);
+  if (imunify) {
+    console.log(`[directIP] Imunify360 challenge detected (${imunify.type})`);
+    if (imunify.type === "redirect" && imunify.location) {
+      const solved = await solveImunifyChallenge(imunify.location, "directIP");
+      if (solved) {
+        // Retry the original request with the new cookies
+        headers["cookie"] = getCookieString();
+        const retry = await fetchViaDirectIPRaw(path, headers, method, body);
+        const sc2 = getSetCookieHeaders(retry.headers);
+        if (sc2.length > 0) updateCookieJar(sc2);
+        // Check if still challenged
+        const still = isImunifyChallenge(retry);
+        if (!still) return retry;
+        console.warn("[directIP] Still challenged after solving — giving up on this strategy");
+      }
+    }
+    // Return the challenge response so fallback strategies can try
+    return res;
+  }
+
+  return res;
+}
+
+/**
  * Fetch via domain name (through Cloudflare if enabled).
  */
-async function fetchViaDomain(path, headers, method, body) {
+/**
+ * Raw domain fetch — no Imunify handling.
+ */
+async function fetchViaDomainRaw(path, headers, method, body) {
   const url = `${TARGET_ORIGIN}${path}`;
   const options = {
     method,
@@ -215,9 +446,17 @@ async function fetchViaDomain(path, headers, method, body) {
     }
   }
 
+  // Collect all set-cookie headers properly
   const resHeaders = {};
   for (const [k, v] of res.headers.entries()) {
     resHeaders[k] = v;
+  }
+  // fetch() merges set-cookie; get them via getSetCookie if available
+  if (res.headers.getSetCookie) {
+    const setCookies = res.headers.getSetCookie();
+    if (setCookies.length > 0) {
+      resHeaders["set-cookie"] = setCookies;
+    }
   }
 
   return {
@@ -229,9 +468,46 @@ async function fetchViaDomain(path, headers, method, body) {
 }
 
 /**
+ * Domain fetch with Imunify360 challenge auto-solving.
+ */
+async function fetchViaDomain(path, headers, method, body) {
+  if (getCookieString() && !headers["cookie"]) {
+    headers["cookie"] = getCookieString();
+  }
+
+  const res = await fetchViaDomainRaw(path, headers, method, body);
+
+  const sc = getSetCookieHeaders(res.headers);
+  if (sc.length > 0) updateCookieJar(sc);
+
+  const imunify = isImunifyChallenge(res);
+  if (imunify) {
+    console.log(`[domain] Imunify360 challenge detected (${imunify.type})`);
+    if (imunify.type === "redirect" && imunify.location) {
+      const solved = await solveImunifyChallenge(imunify.location, "cloudflareDomain");
+      if (solved) {
+        headers["cookie"] = getCookieString();
+        const retry = await fetchViaDomainRaw(path, headers, method, body);
+        const sc2 = getSetCookieHeaders(retry.headers);
+        if (sc2.length > 0) updateCookieJar(sc2);
+        const still = isImunifyChallenge(retry);
+        if (!still) return retry;
+        console.warn("[domain] Still challenged after solving");
+      }
+    }
+    return res;
+  }
+
+  return res;
+}
+
+/**
  * Detect Cloudflare challenge / block pages
  */
 function isCloudflareChallenge(upstreamRes) {
+  // First check if it's an Imunify360 challenge (not Cloudflare)
+  if (isImunifyChallenge(upstreamRes)) return false; // handled separately
+
   const status = upstreamRes.status;
   const hasCfRay = !!getHeader(upstreamRes.headers, "cf-ray");
   const server = getHeader(upstreamRes.headers, "server") || "";
@@ -282,11 +558,13 @@ async function fetchFromOrigin(path, headers, method, body) {
   if (isStrategyAvailable("directIP")) {
     try {
       const res = await fetchViaDirectIP(path, headers, method, body);
-      if (!isCloudflareChallenge(res)) {
+      if (!isCloudflareChallenge(res) && !isImunifyChallenge(res)) {
         markStrategyOk("directIP");
         return res;
       }
-      console.warn("[directIP] Cloudflare challenge on direct IP");
+      if (isCloudflareChallenge(res)) {
+        console.warn("[directIP] Cloudflare challenge on direct IP");
+      }
       markStrategyFail("directIP");
     } catch (err) {
       errors.push(`directIP: ${err.message}`);
@@ -298,23 +576,26 @@ async function fetchFromOrigin(path, headers, method, body) {
   if (isStrategyAvailable("cloudflareDomain")) {
     try {
       const res = await fetchViaDomain(path, headers, method, body);
-      if (!isCloudflareChallenge(res)) {
+      if (!isCloudflareChallenge(res) && !isImunifyChallenge(res)) {
         markStrategyOk("cloudflareDomain");
         return res;
       }
-      console.warn("[cloudflareDomain] Cloudflare challenge detected");
+      if (isCloudflareChallenge(res)) {
+        console.warn("[cloudflareDomain] Cloudflare challenge detected");
+      }
       markStrategyFail("cloudflareDomain");
-      errors.push("cloudflareDomain: Cloudflare challenge");
+      errors.push("cloudflareDomain: challenge");
     } catch (err) {
       errors.push(`cloudflareDomain: ${err.message}`);
       markStrategyFail("cloudflareDomain");
     }
   }
 
-  // Last-resort: retry direct IP
+  // Last-resort: retry direct IP with current cookies
   try {
+    headers["cookie"] = getCookieString();
     const res = await fetchViaDirectIP(path, headers, method, body);
-    if (!isCloudflareChallenge(res)) {
+    if (!isCloudflareChallenge(res) && !isImunifyChallenge(res)) {
       markStrategyOk("directIP");
       return res;
     }
@@ -469,6 +750,10 @@ app.get("/_mirror/health", (req, res) => {
       directIP: strategies.directIP,
       cloudflareDomain: strategies.cloudflareDomain,
     },
+    cookieJar: {
+      count: cookieJar.size,
+      keys: [...cookieJar.keys()],
+    },
   });
 });
 
@@ -584,11 +869,27 @@ app.all("*", async (req, res) => {
 async function probeStrategies() {
   console.log("[startup] Probing upstream strategies...");
 
+  // Use GET instead of HEAD — Imunify360 often blocks HEAD requests
+  const probeHeaders = {
+    host: TARGET_HOST,
+    "user-agent": getNextUA(),
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "accept-encoding": "gzip, deflate, br",
+    connection: "keep-alive",
+    "upgrade-insecure-requests": "1",
+  };
+
   try {
-    const res = await fetchViaDirectIP("/", { host: TARGET_HOST, "user-agent": getNextUA() }, "HEAD", null);
+    // fetchViaDirectIP now auto-solves Imunify challenges
+    const res = await fetchViaDirectIP("/", { ...probeHeaders }, "GET", null);
+    const imunify = isImunifyChallenge(res);
     if (isCloudflareChallenge(res)) {
       console.log(`[startup] Direct IP → Cloudflare challenge (status ${res.status})`);
       strategies.directIP.ok = false;
+    } else if (imunify) {
+      console.log(`[startup] Direct IP → Imunify360 challenge persists (status ${res.status})`);
+      // Don't mark as down — it may work on next try with cookies
     } else {
       console.log(`[startup] Direct IP → OK (status ${res.status})`);
     }
@@ -598,10 +899,13 @@ async function probeStrategies() {
   }
 
   try {
-    const res = await fetchViaDomain("/", { host: TARGET_HOST, "user-agent": getNextUA(), accept: "*/*" }, "HEAD", null);
+    const res = await fetchViaDomain("/", { ...probeHeaders }, "GET", null);
+    const imunify = isImunifyChallenge(res);
     if (isCloudflareChallenge(res)) {
       console.log(`[startup] Domain → Cloudflare challenge (status ${res.status})`);
       strategies.cloudflareDomain.ok = false;
+    } else if (imunify) {
+      console.log(`[startup] Domain → Imunify360 challenge persists (status ${res.status})`);
     } else {
       console.log(`[startup] Domain → OK (status ${res.status})`);
     }
@@ -610,6 +914,7 @@ async function probeStrategies() {
     strategies.cloudflareDomain.ok = false;
   }
 
+  console.log(`[startup] Cookie jar: ${cookieJar.size} cookies stored`);
   if (!strategies.directIP.ok && !strategies.cloudflareDomain.ok) {
     console.warn("[startup] WARNING: Both strategies currently failing — will retry on each request");
   }
