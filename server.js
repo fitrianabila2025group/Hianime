@@ -24,6 +24,11 @@ const MIRROR_HOST = process.env.MIRROR_HOST || "";
 // Timeout for upstream requests (ms)
 const UPSTREAM_TIMEOUT = parseInt(process.env.UPSTREAM_TIMEOUT) || 15000;
 
+// Custom logo path (served from /public/hianime.png)
+const CUSTOM_LOGO = process.env.CUSTOM_LOGO || "/public/hianime.png";
+// Original logo filename pattern to replace
+const ORIGINAL_LOGO_PATTERN = process.env.ORIGINAL_LOGO_PATTERN || "9453036c-bed9-4ac2-987c-d354b4bcaafa";
+
 app.use(compression());
 app.set("trust proxy", true);
 
@@ -670,6 +675,20 @@ function rewriteHTML(html, req) {
     out = out.replace(jsonEscapedTargetHttp, jsonEscapedMirror);
   }
 
+  // ---- Replace original logo with custom logo ----
+  // Match the logo <img> inside <h1 class="logos"> and replace its src
+  out = out.replace(
+    /(<h1\s+class="logos">\s*<a[^>]*>\s*<img[^>]*?)\s*src="[^"]*"/gi,
+    `$1 src="${CUSTOM_LOGO}"`
+  );
+  // Also catch any <img> with the original logo filename anywhere
+  if (ORIGINAL_LOGO_PATTERN) {
+    out = out.replace(
+      new RegExp(`(<img[^>]*?)src="[^"]*${escapeRegex(ORIGINAL_LOGO_PATTERN)}[^"]*"`, "gi"),
+      `$1src="${CUSTOM_LOGO}"`
+    );
+  }
+
   return out;
 }
 
@@ -741,6 +760,14 @@ function getContentCategory(contentType) {
 // ============================================================
 // HEALTH CHECK ENDPOINT
 // ============================================================
+
+// Serve custom static assets (logo, etc.) from /public/
+const path_module = require("path");
+app.use("/public", express.static(path_module.join(__dirname, "public"), {
+  maxAge: "7d",
+  immutable: true,
+}));
+
 app.get("/_mirror/health", (req, res) => {
   res.json({
     status: "ok",
