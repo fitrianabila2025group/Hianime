@@ -636,6 +636,9 @@ function rewriteHTML(html, req) {
   // Replace protocol-relative
   out = out.replace(new RegExp(`//${escapeRegex(TARGET_HOST)}`, "gi"), `//${mirrorHost}`);
 
+  // Google Search Console verification
+  out = out.replace(/(<head(?:\s[^>]*)?>)/i, `$1\n<meta name="google-site-verification" content="qfWtPpNc4-iQ0DF9op95XatgoHHzyXf6U6nyjcVZygA" />`);
+
   // Canonical tag
   out = out.replace(/<link\s+[^>]*rel\s*=\s*["']canonical["'][^>]*\/?>/gi, "");
   const canonicalURL = `${mirrorOrigin}${req.originalUrl}`;
