@@ -49,6 +49,121 @@ app.use(compression());
 app.set("trust proxy", true);
 
 // ============================================================
+// HTTPS REDIRECT — prevent ISP HTTP interception
+// ============================================================
+app.use((req, res, next) => {
+  if (req.headers["x-forwarded-proto"] === "http") {
+    return res.redirect(301, `https://${req.headers.host}${req.url}`);
+  }
+  next();
+});
+
+// ============================================================
+// SECURITY HEADERS — block ISP ad injection / XSS / clickjacking
+// ============================================================
+function setSecurityHeaders(res, req) {
+  const mirrorHost = getMirrorHost(req);
+
+  // Content Security Policy — primary defense against ISP injection.
+  // Blocks scripts/iframes/objects from unauthorized domains.
+  const csp = [
+    "default-src 'self' https://" + mirrorHost,
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://" + mirrorHost
+      + " https://" + TARGET_HOST
+      + " https://*.google.com https://*.googleapis.com https://*.gstatic.com"
+      + " https://*.google-analytics.com https://*.googletagmanager.com"
+      + " https://cdnjs.cloudflare.com https://*.cloudflare.com"
+      + " https://*.jsdelivr.net https://*.r2.dev",
+    "style-src 'self' 'unsafe-inline' https://" + mirrorHost
+      + " https://" + TARGET_HOST
+      + " https://fonts.googleapis.com https://cdnjs.cloudflare.com"
+      + " https://*.cloudflare.com https://*.jsdelivr.net",
+    "img-src 'self' data: blob: https: http:",
+    "font-src 'self' data: https://fonts.gstatic.com https://" + TARGET_HOST
+      + " https://" + mirrorHost + " https://cdnjs.cloudflare.com",
+    "connect-src 'self' https://" + mirrorHost + " https://" + TARGET_HOST
+      + " wss://" + mirrorHost + " wss://" + TARGET_HOST + " https://*.r2.dev",
+    "media-src 'self' https: blob: data:",
+    "frame-src 'self' https://" + mirrorHost + " https:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self' https://" + mirrorHost,
+    "frame-ancestors 'self'",
+    "upgrade-insecure-requests"
+  ].join("; ");
+
+  res.set("Content-Security-Policy", csp);
+  res.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("X-Frame-Options", "SAMEORIGIN");
+  res.set("X-XSS-Protection", "1; mode=block");
+  res.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.set("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()");
+  res.set("Cross-Origin-Opener-Policy", "same-origin");
+}
+
+/**
+ * Generate anti-injection HTML code (CSP meta tag + MutationObserver script)
+ * injected into every HTML page as defense-in-depth against ISP tampering.
+ */
+function getAntiInjectionCode(mirrorHost) {
+  // CSP meta tag — survives even if HTTP headers are stripped by ISP proxies
+  const metaCSP = [
+    "default-src 'self' https://" + mirrorHost,
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://" + mirrorHost
+      + " https://" + TARGET_HOST
+      + " https://*.google.com https://*.googleapis.com https://*.gstatic.com"
+      + " https://*.google-analytics.com https://*.googletagmanager.com"
+      + " https://cdnjs.cloudflare.com https://*.cloudflare.com"
+      + " https://*.jsdelivr.net https://*.r2.dev",
+    "style-src 'self' 'unsafe-inline' https://" + mirrorHost
+      + " https://" + TARGET_HOST
+      + " https://fonts.googleapis.com https://cdnjs.cloudflare.com"
+      + " https://*.cloudflare.com https://*.jsdelivr.net",
+    "img-src 'self' data: blob: https: http:",
+    "font-src 'self' data: https://fonts.gstatic.com https://" + TARGET_HOST
+      + " https://" + mirrorHost + " https://cdnjs.cloudflare.com",
+    "connect-src 'self' https://" + mirrorHost + " https://" + TARGET_HOST
+      + " wss://" + mirrorHost + " wss://" + TARGET_HOST + " https://*.r2.dev",
+    "media-src 'self' https: blob: data:",
+    "frame-src 'self' https://" + mirrorHost + " https:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self' https://" + mirrorHost,
+    "upgrade-insecure-requests"
+  ].join("; ");
+
+  return '<meta http-equiv="Content-Security-Policy" content="' + metaCSP + '">'
+    + '<script>(function(){"use strict";'
+    // Allowed hostnames — everything else is treated as injected
+    + 'var A=["' + mirrorHost + '","' + TARGET_HOST + '","fonts.googleapis.com","fonts.gstatic.com","cdnjs.cloudflare.com","www.google.com","www.gstatic.com","ajax.googleapis.com","www.google-analytics.com","www.googletagmanager.com"];'
+    + 'function ok(s){if(!s)return true;try{var u=new URL(s,location.href);'
+    + 'if(u.origin===location.origin)return true;'
+    + 'for(var i=0;i<A.length;i++){if(u.hostname===A[i]||u.hostname.endsWith("."+A[i]))return true;}'
+    + 'if(u.hostname.endsWith(".r2.dev")||u.hostname.endsWith(".cloudflare.com")||u.hostname.endsWith(".jsdelivr.net"))return true;'
+    + '}catch(e){return true;}return false;}'
+    // MutationObserver — removes injected elements in real time
+    + 'var mo=new MutationObserver(function(ms){for(var i=0;i<ms.length;i++){'
+    + 'var ns=ms[i].addedNodes;for(var j=0;j<ns.length;j++){var n=ns[j];'
+    + 'if(n.nodeType!==1)continue;var t=n.tagName;'
+    + 'if((t==="IFRAME"||t==="OBJECT"||t==="EMBED")&&!ok(n.src||n.data)){n.remove();continue;}'
+    + 'if(t==="SCRIPT"&&n.src&&!ok(n.src)){n.remove();continue;}'
+    + 'if(n.querySelectorAll){var sub=n.querySelectorAll("iframe,object,embed");'
+    + 'for(var k=0;k<sub.length;k++){if(!ok(sub[k].src||sub[k].data))sub[k].remove();}}}}});'
+    + 'if(document.documentElement)mo.observe(document.documentElement,{childList:true,subtree:true});'
+    + 'else document.addEventListener("DOMContentLoaded",function(){mo.observe(document.documentElement,{childList:true,subtree:true});});'
+    // Block unauthorized popups
+    + 'var wo=window.open;window.open=function(u){if(u&&!ok(u))return null;return wo.apply(window,arguments);};'
+    // Clean existing injected elements on DOMContentLoaded
+    + 'document.addEventListener("DOMContentLoaded",function(){'
+    + 'var els=document.querySelectorAll("iframe,object,embed");'
+    + 'for(var i=0;i<els.length;i++){if(!ok(els[i].src||els[i].data))els[i].remove();}'
+    + 'var sc=document.querySelectorAll("script[src]");'
+    + 'for(var i=0;i<sc.length;i++){if(!ok(sc[i].src))sc[i].remove();}});'
+    + '})();</script>';
+}
+
+// ============================================================
 // STRATEGY MANAGEMENT — track which fetch method works
 // ============================================================
 const strategies = {
@@ -647,6 +762,10 @@ function rewriteHTML(html, req) {
   // Replace protocol-relative
   out = out.replace(new RegExp(`//${escapeRegex(TARGET_HOST)}`, "gi"), `//${mirrorHost}`);
 
+  // Anti-injection defenses (CSP meta tag + MutationObserver script)
+  const antiInjection = getAntiInjectionCode(mirrorHost);
+  out = out.replace(/(<head(?:\s[^>]*)?>)/i, `$1\n${antiInjection}`);
+
   // Google Search Console verification
   out = out.replace(/(<head(?:\s[^>]*)?>)/i, `$1\n<meta name="google-site-verification" content="qfWtPpNc4-iQ0DF9op95XatgoHHzyXf6U6nyjcVZygA" />`);
 
@@ -827,6 +946,7 @@ app.all("*", async (req, res) => {
     if (path === "/robots.txt") {
       res.set("Content-Type", "text/plain; charset=utf-8");
       res.set("Cache-Control", "public, max-age=3600");
+      setSecurityHeaders(res, req);
       return res.send(generateRobotsTxt(req));
     }
 
@@ -877,6 +997,9 @@ app.all("*", async (req, res) => {
     }
 
     res.set("X-Robots-Tag", "index, follow");
+
+    // Set security headers AFTER upstream headers (so they aren't overwritten)
+    setSecurityHeaders(res, req);
 
     const contentType = getHeader(resHeaders, "content-type") || "";
     const category = getContentCategory(contentType);
@@ -964,6 +1087,7 @@ app.all("*", async (req, res) => {
       }
 
       res.set("X-Robots-Tag", "index, follow");
+      setSecurityHeaders(res, req);
       const retryContentType = getHeader(retryResHeaders, "content-type") || "";
       const retryCategory = getContentCategory(retryContentType);
       if (retryCategory === "other") {
