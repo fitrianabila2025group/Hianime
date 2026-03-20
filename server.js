@@ -10,6 +10,47 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
+// PROCESS-LEVEL ERROR HANDLING — Prevent Crashes
+// ============================================================
+process.on("uncaughtException", (err) => {
+  console.error(`[FATAL] Uncaught Exception: ${err.message}`);
+  console.error(err.stack);
+  // Don't exit — try to keep running
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error(`[FATAL] Unhandled Rejection at:`, promise, `reason:`, reason);
+  // Don't exit — try to keep running
+});
+
+// Graceful shutdown handling
+let isShuttingDown = false;
+function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[shutdown] Received ${signal}, shutting down gracefully...`);
+  
+  // Stop accepting new connections
+  if (server) {
+    server.close(() => {
+      console.log("[shutdown] Server closed");
+      process.exit(0);
+    });
+  }
+  
+  // Force exit after 10 seconds
+  setTimeout(() => {
+    console.error("[shutdown] Forced exit after timeout");
+    process.exit(1);
+  }, 10000);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+let server = null; // Will be assigned when app.listen() is called
+
+// ============================================================
 // CONFIGURATION
 // ============================================================
 const TARGET_HOST = process.env.TARGET_HOST || "hianime.city";
@@ -24,21 +65,47 @@ const MIRROR_HOST = process.env.MIRROR_HOST || "";
 // Timeout for upstream requests (ms)
 const UPSTREAM_TIMEOUT = parseInt(process.env.UPSTREAM_TIMEOUT) || 30000;
 
-// HTTPS agents with keepalive for connection reuse
-const directIPAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 30000,
-  maxSockets: 50,
-  maxFreeSockets: 10,
-  timeout: UPSTREAM_TIMEOUT,
-});
-const domainAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 30000,
-  maxSockets: 50,
-  maxFreeSockets: 10,
-  timeout: UPSTREAM_TIMEOUT,
-});
+// Create HTTPS agents — will be recreated if they fail
+function createAgent() {
+  return new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 15000,
+    maxSockets: 100,
+    maxFreeSockets: 20,
+    timeout: UPSTREAM_TIMEOUT,
+    scheduling: "fifo", // Better for consistent connections
+  });
+}
+
+let directIPAgent = createAgent();
+let domainAgent = createAgent();
+
+// Agent refresh — recreate agents when connections fail
+let agentRefreshCount = 0;
+function refreshAgents() {
+  agentRefreshCount++;
+  console.log(`[agent] Refreshing HTTPS agents (refresh #${agentRefreshCount})`);
+  
+  // Destroy old agents
+  try {
+    directIPAgent.destroy();
+    domainAgent.destroy();
+  } catch (e) {
+    console.warn(`[agent] Error destroying old agents: ${e.message}`);
+  }
+  
+  // Create new agents
+  directIPAgent = createAgent();
+  domainAgent = createAgent();
+}
+
+// Refresh agents periodically to prevent stale connections
+setInterval(() => {
+  // Only refresh if idle (not during active failures)
+  if (strategies && strategies.directIP.ok && strategies.cloudflareDomain.ok) {
+    refreshAgents();
+  }
+}, 10 * 60 * 1000); // Every 10 minutes
 
 // Custom logo path (served from /public/hianime.png)
 const CUSTOM_LOGO = process.env.CUSTOM_LOGO || "https://pub-b809a12aff9f4b918a309f6bdbd29455.r2.dev/hianime.png";
@@ -407,24 +474,36 @@ function getAntiInjectionCode(mirrorHost) {
 // STRATEGY MANAGEMENT — track which fetch method works
 // ============================================================
 const strategies = {
-  directIP: { ok: true, fails: 0, lastFail: 0 },
-  cloudflareDomain: { ok: true, fails: 0, lastFail: 0 },
+  directIP: { ok: true, fails: 0, lastFail: 0, consecutiveSuccess: 0 },
+  cloudflareDomain: { ok: true, fails: 0, lastFail: 0, consecutiveSuccess: 0 },
 };
 
 const FAIL_THRESHOLD = 3;
-const RECOVERY_MS = 5 * 60 * 1000;
+const RECOVERY_MS = 30 * 1000; // Reduced from 5 minutes to 30 seconds for faster recovery
+const SUCCESS_RESET_THRESHOLD = 2; // Reset fail count after 2 consecutive successes
 
 function markStrategyOk(name) {
   strategies[name].ok = true;
-  strategies[name].fails = 0;
+  strategies[name].consecutiveSuccess++;
+  
+  // Reset fail count after enough consecutive successes
+  if (strategies[name].consecutiveSuccess >= SUCCESS_RESET_THRESHOLD) {
+    strategies[name].fails = 0;
+    strategies[name].consecutiveSuccess = 0;
+  }
 }
 
 function markStrategyFail(name) {
   strategies[name].fails++;
+  strategies[name].consecutiveSuccess = 0;
   strategies[name].lastFail = Date.now();
+  
   if (strategies[name].fails >= FAIL_THRESHOLD) {
     strategies[name].ok = false;
     console.warn(`[strategy] ${name} marked DOWN after ${FAIL_THRESHOLD} consecutive failures`);
+    
+    // Refresh agents when strategy fails — connection might be stale
+    refreshAgents();
   }
 }
 
@@ -432,7 +511,7 @@ function isStrategyAvailable(name) {
   const s = strategies[name];
   if (s.ok) return true;
   if (Date.now() - s.lastFail > RECOVERY_MS) {
-    console.log(`[strategy] ${name} attempting recovery...`);
+    console.log(`[strategy] ${name} attempting recovery after ${Math.round((Date.now() - s.lastFail) / 1000)}s...`);
     return true;
   }
   return false;
@@ -740,13 +819,31 @@ function fetchViaDirectIPRaw(path, headers, method, body) {
           strategy: "directIP",
         });
       });
+      res.on("error", (err) => {
+        console.error(`[directIP] Response error: ${err.message}`);
+        reject(err);
+      });
     });
 
     req.on("timeout", () => {
       req.destroy();
       reject(new Error("Direct IP request timed out"));
     });
-    req.on("error", reject);
+    
+    req.on("error", (err) => {
+      // Handle specific socket errors
+      if (err.code === "ECONNRESET" || err.code === "ECONNREFUSED" || err.code === "ETIMEDOUT" || err.code === "EPIPE") {
+        console.warn(`[directIP] Socket error (${err.code}), may need agent refresh`);
+      }
+      reject(err);
+    });
+
+    // Handle socket-level issues
+    req.on("socket", (socket) => {
+      socket.on("error", (err) => {
+        console.warn(`[directIP] Socket error: ${err.message}`);
+      });
+    });
 
     if (body && body.length > 0) req.write(body);
     req.end();
@@ -823,13 +920,31 @@ function fetchViaDomainRaw(path, headers, method, body) {
           strategy: "cloudflareDomain",
         });
       });
+      res.on("error", (err) => {
+        console.error(`[domain] Response error: ${err.message}`);
+        reject(err);
+      });
     });
 
     req.on("timeout", () => {
       req.destroy();
       reject(new Error("Domain request timed out"));
     });
-    req.on("error", reject);
+    
+    req.on("error", (err) => {
+      // Handle specific socket errors
+      if (err.code === "ECONNRESET" || err.code === "ECONNREFUSED" || err.code === "ETIMEDOUT" || err.code === "EPIPE") {
+        console.warn(`[domain] Socket error (${err.code}), may need agent refresh`);
+      }
+      reject(err);
+    });
+
+    // Handle socket-level issues
+    req.on("socket", (socket) => {
+      socket.on("error", (err) => {
+        console.warn(`[domain] Socket error: ${err.message}`);
+      });
+    });
 
     if (body && body.length > 0 && !["GET", "HEAD"].includes(method.toUpperCase())) {
       req.write(body);
@@ -1245,6 +1360,9 @@ app.all("*", async (req, res) => {
     const contentType = getHeader(resHeaders, "content-type") || "";
     const category = getContentCategory(contentType);
 
+    // Reset error count on success
+    global.proxyErrorCount = 0;
+
     if (category === "other") {
       res.status(upstreamRes.status);
       return res.send(upstreamRes.body);
@@ -1281,17 +1399,28 @@ app.all("*", async (req, res) => {
   } catch (err) {
     console.error(`Proxy error [${req.method} ${req.originalUrl}]:`, err.message);
 
+    // Track consecutive proxy errors for agent refresh
+    if (!global.proxyErrorCount) global.proxyErrorCount = 0;
+    global.proxyErrorCount++;
+    
+    // Refresh agents if we're seeing repeated failures
+    if (global.proxyErrorCount >= 5) {
+      console.warn(`[recovery] ${global.proxyErrorCount} consecutive errors — refreshing agents`);
+      refreshAgents();
+      global.proxyErrorCount = 0;
+    }
+
     // Retry once with a small delay
     try {
       await new Promise(r => setTimeout(r, 1000));
       console.log(`[retry] Retrying ${req.method} ${req.originalUrl}...`);
 
-      // Reset strategies for retry attempt
-      if (!strategies.directIP.ok && Date.now() - strategies.directIP.lastFail > 10000) {
+      // Reset strategies for retry attempt — more aggressive recovery
+      if (!strategies.directIP.ok) {
         strategies.directIP.ok = true;
         strategies.directIP.fails = 0;
       }
-      if (!strategies.cloudflareDomain.ok && Date.now() - strategies.cloudflareDomain.lastFail > 10000) {
+      if (!strategies.cloudflareDomain.ok) {
         strategies.cloudflareDomain.ok = true;
         strategies.cloudflareDomain.fails = 0;
       }
@@ -1332,6 +1461,7 @@ app.all("*", async (req, res) => {
       const retryContentType = getHeader(retryResHeaders, "content-type") || "";
       const retryCategory = getContentCategory(retryContentType);
       if (retryCategory === "other") {
+        global.proxyErrorCount = 0; // Reset error count on success
         res.status(retryRes.status);
         return res.send(retryRes.body);
       }
@@ -1349,21 +1479,28 @@ app.all("*", async (req, res) => {
           retryText = retryText.replace(new RegExp(`https?://${escapeRegex(TARGET_HOST)}`, "gi"), getMirrorOrigin(req));
           break;
       }
+      global.proxyErrorCount = 0; // Reset error count on success
       res.status(retryRes.status);
       return res.send(retryText);
     } catch (retryErr) {
       console.error(`[retry] Also failed: ${retryErr.message}`);
     }
 
+    // Trigger a background probe if both retries failed
+    console.log("[recovery] Triggering background probe after failed request...");
+    probeStrategies().catch(() => {});
+
     res.status(502).send(`<!DOCTYPE html><html><head><title>Bad Gateway</title><meta http-equiv="refresh" content="5"></head><body style="font-family:sans-serif;text-align:center;padding:60px"><h1>502 Bad Gateway</h1><p>Mirror proxy could not reach upstream server. Auto-retrying in 5 seconds...</p><p style="color:#888;font-size:12px">${new Date().toISOString()}</p></body></html>`);
   }
 });
 
 // ============================================================
-// STARTUP PROBE
+// STARTUP PROBE & PERIODIC HEALTH CHECK
 // ============================================================
 async function probeStrategies() {
-  console.log("[startup] Probing upstream strategies...");
+  if (isShuttingDown) return;
+  
+  console.log("[probe] Probing upstream strategies...");
 
   // Use GET instead of HEAD — Imunify360 often blocks HEAD requests
   const probeHeaders = {
@@ -1376,21 +1513,27 @@ async function probeStrategies() {
     "upgrade-insecure-requests": "1",
   };
 
+  let directIPOk = false;
+  let domainOk = false;
+
   try {
     // fetchViaDirectIP now auto-solves Imunify challenges
     const res = await fetchViaDirectIP("/", { ...probeHeaders }, "GET", null);
     const imunify = isImunifyChallenge(res);
     if (isCloudflareChallenge(res)) {
-      console.log(`[startup] Direct IP → Cloudflare challenge (status ${res.status})`);
+      console.log(`[probe] Direct IP → Cloudflare challenge (status ${res.status})`);
       strategies.directIP.ok = false;
     } else if (imunify) {
-      console.log(`[startup] Direct IP → Imunify360 challenge persists (status ${res.status})`);
+      console.log(`[probe] Direct IP → Imunify360 challenge persists (status ${res.status})`);
       // Don't mark as down — it may work on next try with cookies
     } else {
-      console.log(`[startup] Direct IP → OK (status ${res.status})`);
+      console.log(`[probe] Direct IP → OK (status ${res.status})`);
+      directIPOk = true;
+      strategies.directIP.ok = true;
+      strategies.directIP.fails = 0;
     }
   } catch (err) {
-    console.log(`[startup] Direct IP → FAILED (${err.message})`);
+    console.log(`[probe] Direct IP → FAILED (${err.message})`);
     strategies.directIP.ok = false;
   }
 
@@ -1398,25 +1541,57 @@ async function probeStrategies() {
     const res = await fetchViaDomain("/", { ...probeHeaders }, "GET", null);
     const imunify = isImunifyChallenge(res);
     if (isCloudflareChallenge(res)) {
-      console.log(`[startup] Domain → Cloudflare challenge (status ${res.status})`);
+      console.log(`[probe] Domain → Cloudflare challenge (status ${res.status})`);
       strategies.cloudflareDomain.ok = false;
     } else if (imunify) {
-      console.log(`[startup] Domain → Imunify360 challenge persists (status ${res.status})`);
+      console.log(`[probe] Domain → Imunify360 challenge persists (status ${res.status})`);
     } else {
-      console.log(`[startup] Domain → OK (status ${res.status})`);
+      console.log(`[probe] Domain → OK (status ${res.status})`);
+      domainOk = true;
+      strategies.cloudflareDomain.ok = true;
+      strategies.cloudflareDomain.fails = 0;
     }
   } catch (err) {
-    console.log(`[startup] Domain → FAILED (${err.message})`);
+    console.log(`[probe] Domain → FAILED (${err.message})`);
     strategies.cloudflareDomain.ok = false;
   }
 
-  console.log(`[startup] Cookie jar: ${cookieJar.size} cookies stored`);
+  console.log(`[probe] Cookie jar: ${cookieJar.size} cookies stored`);
+  
   if (!strategies.directIP.ok && !strategies.cloudflareDomain.ok) {
-    console.warn("[startup] WARNING: Both strategies currently failing — will retry on each request");
+    console.warn("[probe] WARNING: Both strategies currently failing — refreshing agents and will retry");
+    refreshAgents();
   }
+  
+  return { directIPOk, domainOk };
 }
 
-app.listen(PORT, "0.0.0.0", () => {
+// Periodic health check — run every 60 seconds to detect upstream recovery
+let healthCheckInterval = null;
+function startPeriodicHealthCheck() {
+  if (healthCheckInterval) return;
+  
+  healthCheckInterval = setInterval(async () => {
+    if (isShuttingDown) return;
+    
+    // Only run probe if at least one strategy is failing
+    if (!strategies.directIP.ok || !strategies.cloudflareDomain.ok) {
+      console.log("[healthcheck] Running periodic probe due to strategy failure...");
+      await probeStrategies();
+    }
+  }, 60 * 1000); // Every 60 seconds
+  
+  console.log("[healthcheck] Periodic health check enabled (every 60s when strategies fail)");
+}
+
+// Also run a less frequent probe even when healthy to refresh cookies
+setInterval(async () => {
+  if (isShuttingDown) return;
+  console.log("[healthcheck] Running scheduled upstream probe...");
+  await probeStrategies();
+}, 5 * 60 * 1000); // Every 5 minutes
+
+server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Mirror proxy running on port ${PORT}`);
   console.log(`Target: ${TARGET_ORIGIN} | Origin IP: ${ORIGIN_IP}`);
   if (MIRROR_HOST) {
@@ -1424,5 +1599,8 @@ app.listen(PORT, "0.0.0.0", () => {
   } else {
     console.log(`Mirror host: auto-detected from requests`);
   }
-  probeStrategies();
+  console.log(`Recovery timeout: ${RECOVERY_MS / 1000}s | Fail threshold: ${FAIL_THRESHOLD}`);
+  probeStrategies().then(() => {
+    startPeriodicHealthCheck();
+  });
 });
