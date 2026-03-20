@@ -216,9 +216,9 @@ function stripAds(html) {
   );
 
   // 3. Remove entire <div class="kln">...</div> ad wrapper blocks
-  //    These contain ad containers; use greedy but bounded matching
+  //    These contain ad scripts only (no nested divs), so match to first </div>
   out = out.replace(
-    /<div\s+class\s*=\s*["']kln["'][^>]*>[\s\S]*?<\/div>\s*(?:<\/div>\s*)*(?=<(?:div|section|main|article|footer|header|nav|aside|script|link|!--|\/body|\/html)|\s*$)/gi,
+    /<div\s+class\s*=\s*["']kln["'][^>]*>(?:(?!<div)[\s\S])*?<\/div>/gi,
     "<!-- ad block removed -->"
   );
 
@@ -446,11 +446,11 @@ function getAntiInjectionCode(mirrorHost) {
     + 'if(n.nodeType!==1)continue;'
     + 'if(isAdEl(n)){kill(n);continue;}'
     + 'var t=n.tagName;'
-    + 'if((t==="IFRAME"||t==="OBJECT"||t==="EMBED")&&!ok(n.src||n.data)){kill(n);continue;}'
+    + 'if((t==="IFRAME"||t==="OBJECT"||t==="EMBED")&&isAd(n.src||n.data||"")){kill(n);continue;}'
     + 'if(t==="SCRIPT"&&n.src&&!ok(n.src)){kill(n);continue;}'
     + 'if(t==="LINK"&&n.href&&isAd(n.href)){kill(n);continue;}'
-    + 'if(n.querySelectorAll){var ads=n.querySelectorAll("[class*=\\"container-\\"],iframe,object,embed,script[src],div.kln");'
-    + 'for(var k=0;k<ads.length;k++){if(isAdEl(ads[k])||!ok(ads[k].src||ads[k].data||""))kill(ads[k]);}}'
+    + 'if(n.querySelectorAll){var ads=n.querySelectorAll("[class*=\\"container-\\"],script[src],div.kln");'
+    + 'for(var k=0;k<ads.length;k++){if(isAdEl(ads[k]))kill(ads[k]);}}'
     + '}}});'
     + 'if(document.documentElement)mo.observe(document.documentElement,{childList:true,subtree:true});'
     + 'else document.addEventListener("DOMContentLoaded",function(){mo.observe(document.documentElement,{childList:true,subtree:true});});'
@@ -466,7 +466,7 @@ function getAntiInjectionCode(mirrorHost) {
     + 'function cleanAll(){'
     + 'document.querySelectorAll("div.kln").forEach(function(e){kill(e);});'
     + 'document.querySelectorAll("[class*=\\"container-\\"]").forEach(function(e){if(/container-[a-f0-9]{20,}/.test(e.className))kill(e);});'
-    + 'document.querySelectorAll("iframe,object,embed").forEach(function(e){if(!ok(e.src||e.data||""))kill(e);});'
+    + 'document.querySelectorAll("iframe,object,embed").forEach(function(e){if(isAd(e.src||e.data||""))kill(e);});'
     + 'document.querySelectorAll("script[src]").forEach(function(e){if(isAd(e.src)||!ok(e.src))kill(e);});'
     + '}'
     + 'document.addEventListener("DOMContentLoaded",cleanAll);'
